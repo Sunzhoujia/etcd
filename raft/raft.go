@@ -383,6 +383,7 @@ func (r *raft) hardState() pb.HardState {
 
 // send schedules persisting state to a stable storage and AFTER that
 // sending the message (as part of next Ready message processing).
+// 除了投票相关的msg，其他msg的Term在send函数里设置
 func (r *raft) send(m pb.Message) {
 	if m.From == None {
 		m.From = r.id
@@ -429,21 +430,26 @@ func (r *raft) sendAppend(to uint64) {
 // argument controls whether messages with no entries will be sent
 // ("empty" messages are useful to convey updated Commit indexes, but
 // are undesirable when we're sending multiple messages in a batch).
+// 该函数是向一个节点发送MsgApp或MsgSnap消息的方法。
 func (r *raft) maybeSendAppend(to uint64, sendIfEmpty bool) bool {
 	pr := r.prs.Progress[to]
+	// 1. 先通过Prgoress的IsPaused方法检查该节点进度，如果该节点进度阻塞了，那么不会向其发送消息。
 	if pr.IsPaused() {
 		return false
 	}
 	m := pb.Message{}
 	m.To = to
-
+	// 2. 获取用于日志匹配的日志条目（index为next index - 1的日志）的term
 	term, errt := r.raftLog.term(pr.Next - 1)
+	// 3. 获取该节点的next index之后的日志。
 	ents, erre := r.raftLog.entries(pr.Next, r.maxMsgSize)
+	// 4. 如果日志长度为0且不需要发送空日志，那么直接返回。
 	if len(ents) == 0 && !sendIfEmpty {
 		return false
 	}
-
+	// 5. 如果步骤2、3中任一步骤产生了错误，说明用于日志匹配的条目已被压缩，该节点落后了太多，因此需要为其发送MsgSnap消息；否则，发送MsgApp消息。
 	if errt != nil || erre != nil { // send snapshot if we failed to get term or entries
+		// 判断了该follower节点最近是否是活跃的，如果不活跃则不会为其发送快照
 		if !pr.RecentActive {
 			r.logger.Debugf("ignore sending snapshot to %x since it is not recently active", to)
 			return false
@@ -465,6 +471,7 @@ func (r *raft) maybeSendAppend(to uint64, sendIfEmpty bool) bool {
 		sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term
 		r.logger.Debugf("%x [firstindex: %d, commit: %d] sent snapshot[index: %d, term: %d] to %x [%s]",
 			r.id, r.raftLog.firstIndex(), r.raftLog.committed, sindex, sterm, to, pr)
+		// 在生成快照并检测快照无误后，需要通过BecomeSnapshot方法将该follower的状态转为StateSnapshot，以阻塞该节点后续的MsgApp消息。
 		pr.BecomeSnapshot(sindex)
 		r.logger.Debugf("%x paused sending replication messages to %x [%s]", r.id, to, pr)
 	} else {
@@ -477,6 +484,7 @@ func (r *raft) maybeSendAppend(to uint64, sendIfEmpty bool) bool {
 			switch pr.State {
 			// optimistically increase the next when in StateReplicate
 			case tracker.StateReplicate:
+				// 提升NextIndex,流式日志复制，并通过inflights进行流控。
 				last := m.Entries[n-1].Index
 				pr.OptimisticUpdate(last)
 				pr.Inflights.Add(last)
@@ -587,6 +595,7 @@ func (r *raft) maybeCommit() bool {
 	return r.raftLog.maybeCommit(mci, r.Term)
 }
 
+// reset方法用于状态机切换角色时初始化相关字段
 func (r *raft) reset(term uint64) {
 	if r.Term != term {
 		r.Term = term
@@ -599,8 +608,11 @@ func (r *raft) reset(term uint64) {
 	r.resetRandomizedElectionTimeout()
 
 	r.abortLeaderTransfer()
-
+	// 初始化vote[]
 	r.prs.ResetVotes()
+
+	// 初始化所有节点的next index为leader日志的last index + 1。
+	// 因为leader刚当选时不知道除了自己之外的节点的复制进度，将除自己外的所有节点的match index置为0，而将自己的match index置为自己的last index。
 	r.prs.Visit(func(id uint64, pr *tracker.Progress) {
 		*pr = tracker.Progress{
 			Match:     0,
@@ -625,6 +637,7 @@ func (r *raft) appendEntry(es ...pb.Entry) (accepted bool) {
 		es[i].Index = li + 1 + uint64(i)
 	}
 	// Track the size of this uncommitted proposal.
+	// 先判断添加entries后是否超过MaxUncommittedEntriesSize的限制，如果超过了该限制，会返回false，拒绝这些propose
 	if !r.increaseUncommittedSize(es) {
 		r.logger.Debugf(
 			"%x appending new entries to log would exceed uncommitted entry size limit; dropping proposal",
@@ -642,6 +655,8 @@ func (r *raft) appendEntry(es ...pb.Entry) (accepted bool) {
 }
 
 // tickElection is run by followers and candidates after r.electionTimeout.
+// 增大electionElapsed的值，当超过electionTimeout, 创建一条MsgHup消息，传给step方法。
+// local message是直接调用step走流程，只有对外的message才会丢入mailbox，有raft的通信模块去发送
 func (r *raft) tickElection() {
 	r.electionElapsed++
 
@@ -705,6 +720,7 @@ func (r *raft) becomeCandidate() {
 	r.logger.Infof("%x became candidate at term %d", r.id, r.Term)
 }
 
+// 预选举与选举的区别在主要在于预选举不会改变状态机的term也不会修改当前term的该节点投出的选票
 func (r *raft) becomePreCandidate() {
 	// TODO(xiangli) remove the panic when the raft implementation is stable
 	if r.state == StateLeader {
@@ -721,6 +737,10 @@ func (r *raft) becomePreCandidate() {
 	r.logger.Infof("%x became pre-candidate at term %d", r.id, r.Term)
 }
 
+// 节点启动时的关于日志复制的处理：
+// 1. reset:初始化所有节点的nextIndex，matchIndex
+// 2. leader 提交一条空日志
+// 3. 在appendEntry的时候会做流控：对uncommited的日志数量做一个限制，超过了则拒绝提议。避免新日志过多无法处理速度跟不上
 func (r *raft) becomeLeader() {
 	// TODO(xiangli) remove the panic when the raft implementation is stable
 	if r.state == StateFollower {
@@ -735,6 +755,8 @@ func (r *raft) becomeLeader() {
 	// (perhaps after having received a snapshot as a result). The leader is
 	// trivially in this state. Note that r.reset() has initialized this
 	// progress with the last index already.
+	// leader日志复制状态变成 StateReplicate
+	// 所以Follower的状态默认为StateProbe
 	r.prs.Progress[r.id].BecomeReplicate()
 
 	// Conservatively set the pendingConfIndex to the last index in the
@@ -744,6 +766,9 @@ func (r *raft) becomeLeader() {
 	// could be expensive.
 	r.pendingConfIndex = r.raftLog.lastIndex()
 
+	// 当选leader时提交一条no-op log的作用：
+	// 1. 获取每个Follower的进度(matchIndex，nextIndex)
+	// 2. 提交过去Term的log
 	emptyEnt := pb.Entry{Data: nil}
 	if !r.appendEntry(emptyEnt) {
 		// This won't happen because we just called reset() above.
@@ -762,7 +787,7 @@ func (r *raft) hup(t CampaignType) {
 		r.logger.Debugf("%x ignoring MsgHup because already leader", r.id)
 		return
 	}
-
+	// 通过promotable()方法判断当前节点能否提升为leader。
 	if !r.promotable() {
 		r.logger.Warningf("%x is unpromotable and can not campaign", r.id)
 		return
@@ -771,6 +796,7 @@ func (r *raft) hup(t CampaignType) {
 	if err != nil {
 		r.logger.Panicf("unexpected error getting unapplied entries (%v)", err)
 	}
+	// 当前节点已提交的日志中，如果有还没应用的ConfChange消息，则也无法被提升为leader
 	if n := numOfPendingConf(ents); n != 0 && r.raftLog.committed > r.raftLog.applied {
 		r.logger.Warningf("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
 		return
@@ -782,7 +808,9 @@ func (r *raft) hup(t CampaignType) {
 
 // campaign transitions the raft instance to candidate state. This must only be
 // called after verifying that this is a legitimate transition.
+// 经过hup函数进行合法性检验后，调用campaign发起投票或者预投票。
 func (r *raft) campaign(t CampaignType) {
+	// 因为调用campaign的方法不止有hup，campaign方法首先还是会检查promotable()是否为真。(transfer_leader这种也会)
 	if !r.promotable() {
 		// This path should not be hit (callers are supposed to check), but
 		// better safe than sorry.
@@ -790,26 +818,29 @@ func (r *raft) campaign(t CampaignType) {
 	}
 	var term uint64
 	var voteMsg pb.MessageType
-	if t == campaignPreElection {
+	if t == campaignPreElection { // preVote阶段不会修改当前节点的Term值，因此发送的MsgPreVote消息的Term应为当前的Term + 1
 		r.becomePreCandidate()
 		voteMsg = pb.MsgPreVote
 		// PreVote RPCs are sent for the next term before we've incremented r.Term.
 		term = r.Term + 1
-	} else {
-		r.becomeCandidate()
+	} else { // 没有开启Pre-Vote或已经完成预投票进入正式投票的流程或是Leader Transfer时(使开启了Pre-Vote，Leader Transfer也不会进行预投票)
+		r.becomeCandidate() // becomeCandidate会将Term + 1
 		voteMsg = pb.MsgVote
 		term = r.Term
 	}
+	// 在发送投票请求前，先给自己投票。poll方法会在更新本地的投票状态并获取当前投票结果。（存在单节点启动的情况）
 	if _, _, res := r.poll(r.id, voteRespMsgType(voteMsg), true); res == quorum.VoteWon {
 		// We won the election after voting for ourselves (which must mean that
 		// this is a single-node cluster). Advance to the next state.
 		if t == campaignPreElection {
 			r.campaign(campaignElection)
 		} else {
-			r.becomeLeader()
+			r.becomeLeader() // 如果逻辑走到这边，说明是单节点启动，不需要广播发送心跳信息
 		}
 		return
 	}
+
+	// 向其它有资格投票的节点发送投票请求
 	var ids []uint64
 	{
 		idMap := r.prs.Voters.IDs()
@@ -830,6 +861,7 @@ func (r *raft) campaign(t CampaignType) {
 		if t == campaignTransfer {
 			ctx = []byte(t)
 		}
+		// 将要发送出去的msg丢到raft节点的mailbox里去。
 		r.send(pb.Message{Term: term, To: id, Type: voteMsg, Index: r.raftLog.lastIndex(), LogTerm: r.raftLog.lastTerm(), Context: ctx})
 	}
 }
@@ -844,15 +876,27 @@ func (r *raft) poll(id uint64, t pb.MessageType, v bool) (granted int, rejected 
 	return r.prs.TallyVotes()
 }
 
+// Step函数是Raft状态机状态转移的入口方法，参数是Raft消息
+// 1.Step方法会检查消息的Term字段，对不同的情况进行不同的处理
+// 2.Step方法还会对与选举相关的一些的消息进行特殊的处理
+// 3.Step会调用raft结构体中step字段中记录的函数签名，对不同state进行不同的状态机转移
 func (r *raft) Step(m pb.Message) error {
 	// Handle the message term, which may result in our stepping down to a follower.
 	switch {
+	// etcd/raft使用Term为0的消息作为本地消息，Step不会对本地消息进行特殊处理，直接进入之后的逻辑。
 	case m.Term == 0:
 		// local message
+	// 收到高Term的msg，主要处理requestVote的消息（在开启checkQuorm和LeadLease的情况下需特殊处理）
+	// 其他的就转成follower，然后修改Term到msg.Term
 	case m.Term > r.Term:
 		if m.Type == pb.MsgVote || m.Type == pb.MsgPreVote {
 			force := bytes.Equal(m.Context, []byte(campaignTransfer))
 			inLease := r.checkQuorum && r.lead != None && r.electionElapsed < r.electionTimeout
+			// force：如果该消息的CampaignType为campaignTransfer，force为真，表示该消息必须被处理
+			// inLease：如果开启了Check Quorum（开启Check Quorum会自动开启Leader Lease），且election timeout超时前收到过leader的消息，
+			//          那么inLease为真，表示当前Leader Lease还没有过期。
+			// 如果!force && inLease，说明该消息不需要被处理，可以直接返回。
+			// 可以避免这种场景：一个刚刚从分区中恢复的高Term节点触发新一轮选举。
 			if !force && inLease {
 				// If a server receives a RequestVote request within the minimum election timeout
 				// of hearing from a current leader, it does not update its term or grant its vote
@@ -863,8 +907,10 @@ func (r *raft) Step(m pb.Message) error {
 		}
 		switch {
 		case m.Type == pb.MsgPreVote:
+			// 如果消息为MsgPreVote消息，那么不需要转为follower
 			// Never change our term in response to a PreVote
 		case m.Type == pb.MsgPreVoteResp && !m.Reject:
+			// 如果消息为MsgPreVoteResp且Reject字段不为真时，那么不需要转为follower
 			// We send pre-vote requests with a term in our future. If the
 			// pre-vote is granted, we will increment our term when we get a
 			// quorum. If it is not, the term comes from the node that
@@ -873,6 +919,9 @@ func (r *raft) Step(m pb.Message) error {
 		default:
 			r.logger.Infof("%x [term: %d] received a %s message with higher term from %x [term: %d]",
 				r.id, r.Term, m.Type, m.From, m.Term)
+
+			// 在转为follower时，新的Term就是该消息的Term。
+			// 如果消息类型是MsgApp、MsgHeartbeat、MsgSnap，说明这是来自leader的消息，那么将lead字段直接置为该消息的发送者的id，否则暂时不知道当前的leader节点是谁。
 			if m.Type == pb.MsgApp || m.Type == pb.MsgHeartbeat || m.Type == pb.MsgSnap {
 				r.becomeFollower(m.Term, m.From)
 			} else {
@@ -903,11 +952,21 @@ func (r *raft) Step(m pb.Message) error {
 			// with "pb.MsgAppResp" of higher term would force leader to step down.
 			// However, this disruption is inevitable to free this stuck node with
 			// fresh election. This can be prevented with Pre-Vote phase.
+
+			// 开启了checkQuorm 或者 prevote的情况下，收到来自leader的低Term消息，当前节点需要发送一条msg使其转成follower。
+			// 主要原因都是网络分区会促使高Term旧log的节点出现，最终导致这部分节点无法加入集群。所以需要使低Term的leader增加Term，重新选举成leader。
+			// 场景1：如果只开启了checkQuorm，则出现分区时，小分区的leader退位，且不断自增Term发起投票请求。
+			//       当分区恢复，大分区的合法leader给小分区的高Term节点发消息，会被拒绝，而小分区的节点的vote请求也会因为log不够新会被大分区节点拒绝，导致小分区节点无法加入集群。
+			// 场景2：如果只开启pre-vote机制，节点在preVote通过后自增Term发送正式选举请求，此时如果分区出现了，把该节点隔离。则这个节点的Term高于集群。
+			//       当分区恢复，高Term节点会收到来自集群第Term的leader的消息，它会拒绝。同时它的投票请求也会因为log不够新而被其他节点拒绝，导致它无法加入集群。
 			r.send(pb.Message{To: m.From, Type: pb.MsgAppResp})
 		} else if m.Type == pb.MsgPreVote {
 			// Before Pre-Vote enable, there may have candidate with higher term,
 			// but less log. After update to Pre-Vote, the cluster may deadlock if
 			// we drop messages with a lower term.
+
+			// 对于term比当前节点term低的预投票请求，无论是否开启了Check Quorum / Leader Lease或Pre-Vote，
+			// 都要通过一条term为当前term的消息，迫使对方转为follower并更新term。
 			r.logger.Infof("%x [logterm: %d, index: %d, vote: %x] rejected %s from %x [logterm: %d, index: %d] at term %d",
 				r.id, r.raftLog.lastTerm(), r.raftLog.lastIndex(), r.Vote, m.Type, m.From, m.LogTerm, m.Index, r.Term)
 			r.send(pb.Message{To: m.From, Term: r.Term, Type: pb.MsgPreVoteResp, Reject: true})
@@ -918,7 +977,7 @@ func (r *raft) Step(m pb.Message) error {
 		}
 		return nil
 	}
-
+	// 除了在预处理阶段中直接丢弃的消息外，还有一些消息不会通过step字段记录的函数处理
 	switch m.Type {
 	case pb.MsgHup:
 		if r.preVote {
@@ -929,6 +988,11 @@ func (r *raft) Step(m pb.Message) error {
 
 	case pb.MsgVote, pb.MsgPreVote:
 		// We can vote if this is a repeat of a vote we've already cast...
+		// 以下三种情况可以安全投票：
+		// 1.该节点当前已为消息的发送者投过票，说明这可能是重复的消息，该节点可以安全地为其重新投票。
+		// 2.该节点还没有投过票且当前term内还没有leader，那么该节点可以为其投票
+		// 3.如果这是MsgPreVote消息且其Term大于当前节点的Term，那么该节点可以为其投票
+		//   注意，如果开启了checkQuorm和lead lease，如果当前节点有个在lease内的leader，则无法投票。但这一逻辑在开头就判断过了。
 		canVote := r.Vote == m.From ||
 			// ...we haven't voted and we don't think there's a leader yet in this term...
 			(r.Vote == None && r.lead == None) ||
@@ -965,6 +1029,8 @@ func (r *raft) Step(m pb.Message) error {
 			// the message (it ignores all out of date messages).
 			// The term in the original message and current local term are the
 			// same in the case of regular votes, but different for pre-votes.
+
+			// 如果该消息的是MsgVote消息，该节点需要记录其将选票投给了谁，并重置election timeout的计时器
 			r.send(pb.Message{To: m.From, Term: m.Term, Type: voteRespMsgType(m.Type)})
 			if m.Type == pb.MsgVote {
 				// Only record real votes.
@@ -972,12 +1038,14 @@ func (r *raft) Step(m pb.Message) error {
 				r.Vote = m.From
 			}
 		} else {
+			// 否则，节点会拒绝该请求，为其发送一条Reject为true的MsgVoteResp或MsgPreVote消息。
 			r.logger.Infof("%x [logterm: %d, index: %d, vote: %x] rejected %s from %x [logterm: %d, index: %d] at term %d",
 				r.id, r.raftLog.lastTerm(), r.raftLog.lastIndex(), r.Vote, m.Type, m.From, m.LogTerm, m.Index, r.Term)
 			r.send(pb.Message{To: m.From, Term: r.Term, Type: voteRespMsgType(m.Type), Reject: true})
 		}
 
 	default:
+		// 除了这些情况外，消息都会通过step字段记录的函数，按照不同的节点角色进行处理。
 		err := r.step(r, m)
 		if err != nil {
 			return err
@@ -991,9 +1059,12 @@ type stepFunc func(r *raft, m pb.Message) error
 func stepLeader(r *raft, m pb.Message) error {
 	// These message types do not require any progress for m.From.
 	switch m.Type {
+	// 该消息为heartbeat timeout超时后通知leader广播心跳消息的消息。因此，收到该消息后，广播心跳消息。
 	case pb.MsgBeat:
 		r.bcastHeartbeat()
 		return nil
+
+	// 该消息为开启Check Quorum时election timeout超时后通知leader进行相关操作的消息。因此，检查活跃的节点数是否达到quorum，如果无法达到，那么退位为follower
 	case pb.MsgCheckQuorum:
 		// The leader should always see itself as active. As a precaution, handle
 		// the case in which the leader isn't in the configuration any more (for
@@ -1020,17 +1091,19 @@ func stepLeader(r *raft, m pb.Message) error {
 		if len(m.Entries) == 0 {
 			r.logger.Panicf("%x stepped empty MsgProp", r.id)
 		}
+		// leader先判断自己是否被ConfChange操作移出集群
 		if r.prs.Progress[r.id] == nil {
 			// If we are not currently a member of the range (i.e. this node
 			// was removed from the configuration while serving as leader),
 			// drop any new proposals.
 			return ErrProposalDropped
 		}
+		// 判断当前是否在进行leader transfer。leader在转移领导权时不会处理propose
 		if r.leadTransferee != None {
 			r.logger.Debugf("%x [term %d] transfer leadership to %x is in progress; dropping proposal", r.id, r.Term, r.leadTransferee)
 			return ErrProposalDropped
 		}
-
+		// 处理confChange Msg
 		for i := range m.Entries {
 			e := &m.Entries[i]
 			var cc pb.ConfChangeI
@@ -1227,6 +1300,9 @@ func stepLeader(r *raft, m pb.Message) error {
 				//    log.
 				nextProbeIdx = r.raftLog.findConflictByTerm(m.RejectHint, m.LogTerm)
 			}
+			// 回退其Next索引
+			// 1. 回退失败，说明这是一条过期的消息，不做处理
+			// 2. 回退成功，且该节点为StateReplicate状态，则调用BecomeProbe使其转为StateProbe状态来查找最后一条匹配日志的位置。回退成功时，还会再次为该节点调用sendAppend方法，为其发送MsgApp消息。
 			if pr.MaybeDecrTo(m.Index, nextProbeIdx) {
 				r.logger.Debugf("%x decreased progress of %x to [%s]", r.id, m.From, pr)
 				if pr.State == tracker.StateReplicate {
@@ -1236,11 +1312,14 @@ func stepLeader(r *raft, m pb.Message) error {
 			}
 		} else {
 			oldPaused := pr.IsPaused()
-			if pr.MaybeUpdate(m.Index) {
+			if pr.MaybeUpdate(m.Index) { // 成功更新了Follower的matchIndex，进入以下逻辑
 				switch {
 				case pr.State == tracker.StateProbe:
+					// 如果该follower处于StateProbe状态且现在跟上了进度，则将其转为StateReplica状态。
 					pr.BecomeReplicate()
 				case pr.State == tracker.StateSnapshot && pr.Match >= pr.PendingSnapshot:
+					// 如果该follower处于StateSnapshot状态且现在跟上了进度，
+					// 且从该follower发送该消息后到leader处理这条消息时，leader没有为其发送新快照（通过比较Match与PendingSnapshot判断），则将其转为StateReplica状态。
 					// TODO(tbg): we should also enter this branch if a snapshot is
 					// received that is below pr.PendingSnapshot but which makes it
 					// possible to use the log again.
@@ -1253,17 +1332,22 @@ func stepLeader(r *raft, m pb.Message) error {
 					pr.BecomeProbe()
 					pr.BecomeReplicate()
 				case pr.State == tracker.StateReplicate:
+					// 如果该follower处于StateReplicate状态，那么释放Inflights中该消息的Index字段值之前的所有消息。因为收到的MsgAppResp可能是乱序的，因此需要释放之前的所有消息（过期消息不会被处理）
 					pr.Inflights.FreeLE(m.Index)
 				}
 
+				// 该方法会根据所有节点的进度更新leader的commit index，在commit index有更新时返回true，否则返回false
 				if r.maybeCommit() {
 					// committed index has progressed for the term, so it is safe
 					// to respond to pending read index requests
 					releasePendingReadIndexMessages(r)
+					// 如果commit index有更新，那么调用bcastAppend方法广播新的committed索引
 					r.bcastAppend()
 				} else if oldPaused {
 					// If we were paused before, this node may be missing the
 					// latest commit index, so send it.
+					// 如果commit index没有更新，还需要进一步判断该follower之前是否是阻塞的，
+					// 如果是那么为该follower发送一条日志复制消息以更新其committed索引，因为在该节点阻塞时可能错过了committed索引的更新消息。
 					r.sendAppend(m.From)
 				}
 				// We've updated flow control information above, which may
@@ -1272,6 +1356,7 @@ func stepLeader(r *raft, m pb.Message) error {
 				// replicate, or when freeTo() covers multiple messages). If
 				// we have more entries to send, send as many messages as we
 				// can (without sending empty messages for the commit index)
+				// 通过for循环继续为该节点发送新的日志复制消息。因为日志复制部分有流控逻辑，因此这里的循环不会成为死循环。
 				for r.maybeSendAppend(m.From, false) {
 				}
 				// Transfer leadership is in progress.
@@ -1341,6 +1426,7 @@ func stepLeader(r *raft, m pb.Message) error {
 			r.logger.Debugf("%x is learner. Ignored transferring leadership", r.id)
 			return nil
 		}
+		// 判断是否正在进行Leader Transfer。如果正在进行但转移的目标不同，那么打断正在进行的Leader Transfer，而执行新的转移。
 		leadTransferee := m.From
 		lastLeadTransferee := r.leadTransferee
 		if lastLeadTransferee != None {
@@ -1361,6 +1447,9 @@ func stepLeader(r *raft, m pb.Message) error {
 		// Transfer leadership should be finished in one electionTimeout, so reset r.electionElapsed.
 		r.electionElapsed = 0
 		r.leadTransferee = leadTransferee
+		// 判断转移目标的日志是否跟上了leader。如果跟上了，向其发送MsgTimeoutNow消息，让其立即超时并进行新的选举
+		// 否则正常向其发送日志。如果转移目标的日志没有跟上leader，则leader在处理转移目标对其日志复制消息的响应时，
+		// 会判断其是否跟上了leader，如果那时跟上了则向其发送MsgTimeoutNow消息，让其立即超时并进行新的选举
 		if pr.Match == r.raftLog.lastIndex() {
 			r.sendTimeoutNow(leadTransferee)
 			r.logger.Infof("%x sends MsgTimeoutNow to %x immediately as %x already has up-to-date log", r.id, leadTransferee, leadTransferee)
@@ -1443,6 +1532,7 @@ func stepFollower(r *raft, m pb.Message) error {
 		r.lead = m.From
 		r.handleSnapshot(m)
 	case pb.MsgTransferLeader:
+		// 收到应发给leader的消息后转发给leader
 		if r.lead == None {
 			r.logger.Infof("%x no leader at term %d; dropping leader transfer msg", r.id, r.Term)
 			return nil
@@ -1473,11 +1563,12 @@ func stepFollower(r *raft, m pb.Message) error {
 }
 
 func (r *raft) handleAppendEntries(m pb.Message) {
+	// 用于日志匹配的条目在committed之前，说明这是一条过期的消息，因此直接返回MsgAppResp消息，并将消息的Index字段置为committed的值，以让leader快速更新该follower的next index。
 	if m.Index < r.raftLog.committed {
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
 		return
 	}
-
+	// 验证用于日志匹配的字段Term与Index是否与本地的日志匹配。如果匹配并保存了日志，则返回MsgAppResp消息，并将消息的Index字段置为本地最后一条日志的index，以让leader发送后续的日志。
 	if mlastIndex, ok := r.raftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...); ok {
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: mlastIndex})
 	} else {
@@ -1493,6 +1584,8 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 		//
 		// See the other caller for findConflictByTerm (in stepLeader) for a much
 		// more detailed explanation of this mechanism.
+		// 日志不匹配，返回的MsgAppResp的Reject字段会被置为true，且RejectHint字段值为 min(m.Index, r.raftLog.lastIndex())，以便leader快速回退其next index。
+		// 同时，MsgApp的Index字段会透传给MsgAppResp，以便leader校验该消息是否为过期的消息
 		hintIndex := min(m.Index, r.raftLog.lastIndex())
 		hintIndex = r.raftLog.findConflictByTerm(hintIndex, m.LogTerm)
 		hintTerm, err := r.raftLog.term(hintIndex)
@@ -1517,11 +1610,13 @@ func (r *raft) handleHeartbeat(m pb.Message) {
 
 func (r *raft) handleSnapshot(m pb.Message) {
 	sindex, sterm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
+	// 调用restore方法尝试应用快照。如果快照应用功能成功，则返回一条MsgAppResp消息，该消息的Index字段为本地最后一条日志的index；
 	if r.restore(m.Snapshot) {
 		r.logger.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
 			r.id, r.raftLog.committed, sindex, sterm)
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.lastIndex()})
 	} else {
+		// 如果快照没有被应用，那么返回的MsgAppResp消息的Index字段会被置为本地的committed索引
 		r.logger.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
 			r.id, r.raftLog.committed, sindex, sterm)
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
@@ -1532,6 +1627,7 @@ func (r *raft) handleSnapshot(m pb.Message) {
 // configuration of state machine. If this method returns false, the snapshot was
 // ignored, either because it was obsolete or because of an error.
 func (r *raft) restore(s pb.Snapshot) bool {
+	// 如果快照的index没超过本地的committed索引，这说明快照过旧，因此不做处理直接返回false。
 	if s.Metadata.Index <= r.raftLog.committed {
 		return false
 	}
@@ -1580,14 +1676,15 @@ func (r *raft) restore(s pb.Snapshot) bool {
 	}
 
 	// Now go ahead and actually restore.
-
+	// 将快照的index和term与本地日志匹配，如果成功匹配，说明本地日志已经包含了快照覆盖的日志，因此不要应用该快照。
+	// 因为快照覆盖的日志都应是已被提交的日志，这也说明了本地的committed索引落后了，因此调用raftLog的commitTo方法，让本地committed索引快速前进到该快照的index
 	if r.raftLog.matchTerm(s.Metadata.Index, s.Metadata.Term) {
 		r.logger.Infof("%x [commit: %d, lastindex: %d, lastterm: %d] fast-forwarded commit to snapshot [index: %d, term: %d]",
 			r.id, r.raftLog.committed, r.raftLog.lastIndex(), r.raftLog.lastTerm(), s.Metadata.Index, s.Metadata.Term)
 		r.raftLog.commitTo(s.Metadata.Index)
 		return false
 	}
-
+	// 如果到这里方法仍没返回，则可以将快照应用到本地。调用raftLog的restore方法，并返回true。
 	r.raftLog.restore(s)
 
 	// Reset the configuration and add the (potentially updated) peers in anew.
@@ -1615,6 +1712,10 @@ func (r *raft) restore(s pb.Snapshot) bool {
 
 // promotable indicates whether state machine can be promoted to leader,
 // which is true when its own id is in progress list.
+// 判断节点能否被提升为leader的三个条件：
+// 1.节点是否已经从集群中移除，通过progress的map表判断自己的id是否在里面
+// 2.当前节点是否是learner
+// 3.当前节点是否还有未被保存到稳定存储的snapshot
 func (r *raft) promotable() bool {
 	pr := r.prs.Progress[r.id]
 	return pr != nil && !pr.IsLearner && !r.raftLog.hasPendingSnapshot()
@@ -1758,6 +1859,9 @@ func (r *raft) responseToReadIndexReq(req pb.Message, readIndex uint64) pb.Messa
 //
 // Empty payloads are never refused. This is used both for appending an empty
 // entry at a new leader's term, as well as leaving a joint configuration.
+// 有以下几种情况不会拒绝提议
+// 1. uncommittedSize = 0, 一定不会拒绝提议
+// 2. entry为no-op entry，也不会拒接（s=0）
 func (r *raft) increaseUncommittedSize(ents []pb.Entry) bool {
 	var s uint64
 	for _, e := range ents {

@@ -88,18 +88,27 @@ func (l *raftLog) String() string {
 func (l *raftLog) maybeAppend(index, logTerm, committed uint64, ents ...pb.Entry) (lastnewi uint64, ok bool) {
 	if l.matchTerm(index, logTerm) {
 		lastnewi = index + uint64(len(ents))
-		ci := l.findConflict(ents)
+		ci := l.findConflict(ents) // 检查给定的日志切片是否与已有日志有冲突
 		switch {
 		case ci == 0:
 		case ci <= l.committed:
+			// 如果返回值小于当前的committed索引，说明committed前的日志发生了冲突，这违背了Raft算法保证的Log Matching性质，因此会引起panic。
 			l.logger.Panicf("entry %d conflict with committed entry [committed(%d)]", ci, l.committed)
 		default:
+			// 如果返回值大于committed，既可能是冲突发生在committed之后，也可能是有新日志，
+			// 但二者的处理方式都是相同的，即从将从冲突处或新日志处开始的日志覆盖或追加到当前日志中即可。
 			offset := index + 1
 			if ci-offset > uint64(len(ents)) {
 				l.logger.Panicf("index, %d, is out of range [%d]", ci-offset, len(ents))
 			}
 			l.append(ents[ci-offset:]...)
 		}
+		// 更新当前的committed索引为给定的新日志中最后一条日志的index（lastnewi）和传入的新的committed中较小的一个
+		// commitTo方法保证了committed索引只会前进而不会回退，而使用lastnewi和传入的committed中的最小值则是因为传入的数据可能有如下两种情况：
+		// 1. leader给follower复制日志时，如果复制的日志条目超过了单个消息的上限，
+		//    则可能出现leader传给follower的committed值大于该follower复制完这条消息中的日志后的最大index。此时，该follower的新committed值为lastnewi。
+		// 2. follower能够跟上leader，leader传给follower的日志中有未确认被法定数量节点稳定存储的日志，
+		//    此时传入的committed比lastnewi小，该follower的新committed值为传入的committed值。
 		l.commitTo(min(committed, lastnewi))
 		return lastnewi, true
 	}
@@ -127,6 +136,10 @@ func (l *raftLog) append(ents ...pb.Entry) uint64 {
 // An entry is considered to be conflicting if it has the same index but
 // a different term.
 // The index of the given entries MUST be continuously increasing.
+
+// 1. 如果给定的日志与已有的日志的index和term冲突，其会返回第一条冲突的日志条目的index。
+// 2. 如果没有冲突，且给定的日志的所有条目均已在已有日志中，返回0.
+// 3. 如果没有冲突，且给定的日志中包含已有日志中没有的新日志，返回第一条新日志的index。
 func (l *raftLog) findConflict(ents []pb.Entry) uint64 {
 	for _, ne := range ents {
 		if !l.matchTerm(ne.Index, ne.Term) {
@@ -222,6 +235,7 @@ func (l *raftLog) firstIndex() uint64 {
 	return index
 }
 
+// 先判断unstable里面有无entry，没有的话直接返回storage.lastIndex
 func (l *raftLog) lastIndex() uint64 {
 	if i, ok := l.unstable.maybeLastIndex(); ok {
 		return i
@@ -340,6 +354,9 @@ func (l *raftLog) restore(s pb.Snapshot) {
 }
 
 // slice returns a slice of log entries from lo through hi-1, inclusive.
+// 当slice确保给定范围没有越界后，如果这段范围跨了stable和unstable两部分，
+// 那么该方法会分别从Storage获取[lo,unstable.offset)、从unstable获取[unstable.offset, hi)；
+// 否则直接从其中一部分获取完整的切片。在返回切片前，silce还会按照maxSize参数限制返回的切片长度。
 func (l *raftLog) slice(lo, hi, maxSize uint64) ([]pb.Entry, error) {
 	err := l.mustCheckOutOfBounds(lo, hi)
 	if err != nil {

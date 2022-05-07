@@ -54,6 +54,7 @@ type Progress struct {
 	// RecentActive can be reset to false after an election timeout.
 	//
 	// TODO(tbg): the leader should always have this set to true.
+	// 主要用于checkQuorum，判断leader和多数节点保持通信
 	RecentActive bool
 
 	// ProbeSent is used while this follower is in StateProbe. When ProbeSent is
@@ -115,6 +116,7 @@ func (pr *Progress) BecomeProbe() {
 	// If the original state is StateSnapshot, progress knows that
 	// the pending snapshot has been sent to this peer successfully, then
 	// probes from pendingSnapshot + 1.
+	// 当leader得知follower成功应用了快照后，将Follower的状态转变成stateprobe，设置netxIndex
 	if pr.State == StateSnapshot {
 		pendingSnapshot := pr.PendingSnapshot
 		pr.ResetState(StateProbe)
@@ -141,12 +143,14 @@ func (pr *Progress) BecomeSnapshot(snapshoti uint64) {
 // MaybeUpdate is called when an MsgAppResp arrives from the follower, with the
 // index acked by it. The method returns false if the given n index comes from
 // an outdated message. Otherwise it updates the progress and returns true.
+
+// 当leader收到Follower的MsgAppResp或MsgHeartBeatResp，调用此方法更新Follower的进度（match和next字段）。
 func (pr *Progress) MaybeUpdate(n uint64) bool {
 	var updated bool
 	if pr.Match < n {
 		pr.Match = n
 		updated = true
-		pr.ProbeAcked()
+		pr.ProbeAcked() // match得到更新，说明Follower和leader的日志匹配上了，下面开启日志流式复制
 	}
 	pr.Next = max(pr.Next, n+1)
 	return updated
@@ -167,26 +171,34 @@ func (pr *Progress) OptimisticUpdate(n uint64) { pr.Next = n + 1 }
 //
 // If the rejection is genuine, Next is lowered sensibly, and the Progress is
 // cleared for sending log entries.
+
+// 判断是否是过期消息，对过期消息直接返回false，不处理
+// rejected: MsgApp携带的preLogIndex
+// matchHint: follower最后一条日志索引
 func (pr *Progress) MaybeDecrTo(rejected, matchHint uint64) bool {
 	if pr.State == StateReplicate {
 		// The rejection must be stale if the progress has matched and "rejected"
 		// is smaller than "match".
+		// 如果follower的状态为StateReplicate，Next应该是跟上Match的进度的，那么如果rejected不大于Match，那么该消息过期
 		if rejected <= pr.Match {
 			return false
 		}
 		// Directly decrease next to match + 1.
 		//
 		// TODO(tbg): why not use matchHint if it's larger?
+		// 场景：如果开启流式复制，可能msg乱序到达被拒绝，导致rejected > pr.Match，所以要重新发送
 		pr.Next = pr.Match + 1
 		return true
 	}
 
 	// The rejection must be stale if "rejected" does not match next - 1. This
 	// is because non-replicating followers are probed one entry at a time.
+	// 在其它状态下，Next可能没有跟上Match的进度，因此不能通过Match判断。由于其它状态下至多只会为其发送一条日志复制请求，因此只要rejected不等于Next-1，该消息就是过期的。
+	// 场景：match可能是5，next可能从100开始回退，无法用match推断消息是否过期
 	if pr.Next-1 != rejected {
 		return false
 	}
-
+	// 设置rejected表示回退一条index，matchHint是快速回退到Follower的最后一条日志
 	pr.Next = max(min(rejected, matchHint+1), 1)
 	pr.ProbeSent = false
 	return true

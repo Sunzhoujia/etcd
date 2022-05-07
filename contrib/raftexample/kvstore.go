@@ -38,8 +38,11 @@ type kv struct {
 	Val string
 }
 
+// kvstore会通过proposeC与raft模块交互，并通过commitC与errorC接收来自raft模块的消息。
 func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <-chan *commit, errorC <-chan error) *kvstore {
+	// proporseC 是 raftNode 提供的，通过这个 channel 将上层应用的请求发给raft服务器。
 	s := &kvstore{proposeC: proposeC, kvStore: make(map[string]string), snapshotter: snapshotter}
+	// 返回dir下最新的snapshot
 	snapshot, err := s.loadSnapshot()
 	if err != nil {
 		log.Panic(err)
@@ -55,6 +58,7 @@ func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <
 	return s
 }
 
+// 这样实现是不能保证线性一致性的，应该走raft共识。
 func (s *kvstore) Lookup(key string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -62,6 +66,7 @@ func (s *kvstore) Lookup(key string) (string, bool) {
 	return v, ok
 }
 
+// 将kv编码成string，传入proposeC，交给raft模块处理
 func (s *kvstore) Propose(k string, v string) {
 	var buf bytes.Buffer
 	if err := gob.NewEncoder(&buf).Encode(kv{k, v}); err != nil {
@@ -121,6 +126,7 @@ func (s *kvstore) loadSnapshot() (*raftpb.Snapshot, error) {
 	return snapshot, nil
 }
 
+// 将记录键值的map反序列化，替换kvstore
 func (s *kvstore) recoverFromSnapshot(snapshot []byte) error {
 	var store map[string]string
 	if err := json.Unmarshal(snapshot, &store); err != nil {
